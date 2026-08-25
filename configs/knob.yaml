@@ -1,0 +1,52 @@
+# Resistive-knob physics and Physics-OT hyperparameters (sections 5, 9, 10, 13).
+
+knob:
+  theta0: 0.0            # spring rest angle [rad]
+  theta_goal: 1.57        # target rotation [rad]
+  radius: 0.04             # [m], for the procedurally generated asset
+  inertia: 0.002           # I [kg*m^2]
+  damping: 0.02            # b [N*m*s/rad]
+  stiffness: 0.10          # k [N*m/rad]
+  coulomb_torque: 0.04      # tau_c [N*m]
+  v_eps: 0.05               # velocity smoothing scale for tanh Coulomb model [rad/s]
+  success_threshold: 0.05   # |theta - theta_goal| below which the task counts as solved [rad]
+
+reference:
+  num_tokens: 64            # T_H
+  smoothing: 0.0             # UnivariateSpline smoothing factor (0 = exact interpolation)
+
+normalization:
+  sigma_v: 2.0               # velocity normalization scale for the OT ground cost
+  sigma_tau: 0.1              # wrench normalization scale for the OT ground cost
+
+cost_weights:
+  progress: 1.0
+  velocity: 0.25
+  wrench: 1.0
+  time: 0.10
+
+sinkhorn:
+  epsilon: 0.05
+  num_iters: 20
+  robot_window: 32          # rolling window length T_R of robot rollout history used for OT
+
+reward:
+  task: 1.0
+  physics_ot: 0.5
+  action: 0.001
+  success_bonus: 10.0
+
+simulation:
+  physics_dt: 0.0083333       # 120 Hz
+  control_decimation: 4
+  episode_seconds: 6.0
+
+randomization:
+  # Placeholder ranges for later domain-randomization work (Experiment 2,
+  # section 19). Not wired into the Stage-A environment yet -- knob physics
+  # params are constant per training run, taken from the `knob:` block above.
+  robot_object_friction: [0.45, 0.85]
+  actuator_strength_scale: [0.80, 1.20]
+  knob_damping_scale: [0.8, 1.2]
+  knob_friction_scale: [0.8, 1.2]
+  knob_inertia_scale: [0.9, 1.1]

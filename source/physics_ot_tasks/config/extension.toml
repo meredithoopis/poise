@@ -1,0 +1,21 @@
+[package]
+
+version = "0.1.0"
+
+category = "isaaclab"
+readme = "README.md"
+
+title = "Physics-OT Tasks"
+author = "Physics-OT project"
+maintainer = "Physics-OT project"
+description = "IsaacLab Direct-workflow tasks for the Physics-OT resistive-knob environment"
+keywords = ["extension", "isaaclab", "physics-ot", "manipulation"]
+
+[dependencies]
+"isaaclab" = {}
+"isaaclab_assets" = {}
+"isaaclab_rl" = {}
+"isaaclab_tasks" = {}
+
+[[python.module]]
+name = "physics_ot_tasks"
