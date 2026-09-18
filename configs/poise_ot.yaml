@@ -1,0 +1,68 @@
+# POISE-OT Stage 1/2 hyperparameters. Physical knob parameters (inertia,
+# damping, stiffness, theta0, theta_goal, coulomb_torque, v_eps,
+# success_threshold) are still sourced from configs/knob.yaml -- already
+# validated by the Physics-OT Experiment-0 runs; this file only adds
+# POISE-OT-specific hyperparameters that have no Physics-OT equivalent.
+
+token:
+  impulse_window: 5          # h: number of samples in the short-window torque impulse J_tau,t (Eq 23-24)
+
+mech_cost:
+  progress: 1.0               # lambda_s -- always included in C^mech regardless of cost_terms
+  velocity: 0.25                # lambda_v (kinetic-geometry term K, gated by cost_terms>=K)
+  impulse: 1.0                    # lambda_J (dual interaction-impulse term, gated by cost_terms>=K+J)
+  power: 0.1                        # lambda_P (gated by cost_terms>=K+J+P)
+  dissipation: 0.1                    # lambda_D (gated by cost_terms>=K+J+P+D)
+  time: 0.10                            # lambda_t, weak temporal prior -- always included
+  E0: 1.0                                 # characteristic energy scale normalizing the velocity/impulse quadratic forms
+  P0: 1.0                                   # characteristic power scale normalizing the power term
+  PD0: 1.0                                    # characteristic dissipated-power scale normalizing the dissipation term
+  cost_terms: "K+J+P+D"                         # default decomposition level; the K/K+J/K+J+P/K+J+P+D ablation sweeps this
+  sigma_v: 2.0                                    # only used by cost_mode="euclidean_ot" (reuses physics_ot.ot.cost normalization, the old baseline)
+  sigma_tau: 0.1
+
+alignment:
+  window_h: 32                # H: robot rollout window length for windowed OT alignment (Eq window_rollout);
+                                # matches configs/knob.yaml's sinkhorn.robot_window (same physical quantity)
+  epsilon: 0.05
+  num_iters: 20
+
+reward:
+  success_bonus: 10.0          # R_success (Eq task_reward)
+  action_weight: 0.001         # lambda_a
+  unsafe_weight: 0.0           # lambda_u -- always 0 for the 1-DoF knob env: no unsafe states exist (no joint
+                                 # limits modeled in knob_env.py); this is a documented assumption, not a silent drop.
+
+sac:
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  gamma: 0.99
+  tau_polyak: 0.005
+  alpha: 0.2                   # fixed entropy temperature for Stage 1 (auto-tuning is a later option, unused here)
+  grad_clip_norm: 10.0          # standard SAC stabilizer -- Eq task_reward's per-step success bonus is
+                                  # uncapped, so the true return grows ~unboundedly as the policy improves
+                                  # (gamma=0.99); gradient clipping keeps the critic regression stable
+                                  # against that fast-moving/growing target without changing the objective
+  xi: 0.5                      # xi_t, FIXED (mid-range) for Stage 1 -- annealing is explicitly out of scope
+                                 # per the "Learning signal sanity" check in the Stage-1 spec
+  hidden_dims: [256, 256]
+  batch_size: 256
+  replay_capacity: 200000
+  warmup_steps: 1000           # random-action steps before SAC updates begin
+  updates_per_step: 1
+
+stage2:
+  # HOI4D provides no ground-truth object dynamics parameters (mass/inertia/
+  # damping/stiffness/friction) -- these are ASSUMED target values, not
+  # measured. Every Stage-2 script run logs these explicitly (printed + saved
+  # to the output json) so this assumption is never silently lost.
+  assumed_inertia: 0.002
+  assumed_damping: 0.02
+  assumed_stiffness: 0.10
+  assumed_coulomb_torque: 0.04
+  assumed_v_eps: 0.05
+  # Informal plausibility ranges for the Stage-2 "Token sanity" check (paper
+  # Sec 7 -- no formal benchmark exists for these, per its own limitation note).
+  plausible_power_range: [-5.0, 5.0]      # W, order-of-magnitude for a human turning a knob/drawer
+  plausible_impulse_range: [-2.0, 2.0]    # N*m*s
+  theta_ddot_noise_multiplier: 10.0       # differentiation-sanity flag threshold (Sec 4's "three orders of magnitude" warning)

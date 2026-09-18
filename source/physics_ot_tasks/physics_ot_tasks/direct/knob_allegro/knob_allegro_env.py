@@ -7,8 +7,7 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
-from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import saturate, scale
+from isaaclab.utils.math import saturate, unscale_transform
 
 from physics_ot.dynamics.knob import KnobDynamics, KnobParams
 from physics_ot.ot.cost import CostWeights
@@ -35,12 +34,12 @@ class KnobAllegroEnv(DirectRLEnv):
 
         self._dt = self.cfg.sim.dt * self.cfg.decimation
 
-        self._actuated_dof_idx, _ = self._robot.find_joints(self.cfg.actuated_joint_names)
-        self._fingertip_body_idx, _ = self._robot.find_bodies(self.cfg.fingertip_body_names)
+        self._actuated_dof_idx, _ = self._robot.find_joints(self.cfg.actuated_joint_names, preserve_order=True)
+        self._fingertip_body_idx, _ = self._robot.find_bodies(self.cfg.fingertip_body_names, preserve_order=True)
         self._knob_joint_ids, _ = self._knob.find_joints(self.cfg.knob_joint_name)
         self._knob_joint_idx = self._knob_joint_ids[0]
 
-        joint_pos_limits = self._robot.data.joint_limits.torch.to(self.device)
+        joint_pos_limits = self._robot.data.joint_pos_limits.to(self.device)
         self._hand_dof_lower = joint_pos_limits[..., 0]
         self._hand_dof_upper = joint_pos_limits[..., 1]
 
@@ -85,11 +84,33 @@ class KnobAllegroEnv(DirectRLEnv):
         self._history_wrench = torch.zeros(self.num_envs, max_steps, device=self.device)
         self._prev_theta_dot = torch.zeros(self.num_envs, device=self.device)
         self._prev_distance = torch.zeros(self.num_envs, device=self.device)
+        # EMA-smoothed acceleration estimate used only for tau_R (the wrench
+        # fed into the shaping reward): a raw single-step finite difference of
+        # theta_dot is noisy during contact transients (the hand striking/
+        # releasing the knob can change velocity abruptly within one ~33ms
+        # control step), which the entropic-OT-based physics_ot distance is
+        # far more sensitive to than the other reward modes' simpler
+        # aggregations. theta_dot itself (used for observations/history/other
+        # reward modes) stays raw -- this only smooths the acceleration input
+        # to KnobDynamics.required_generalized_force.
+        self._smoothed_theta_ddot = torch.zeros(self.num_envs, device=self.device)
+
+        # Success requires *holding* the goal for success_hold_time seconds,
+        # consecutively -- not just touching it once. Without this, a knob
+        # with low inertia/damping can be brushed through the goal zone
+        # incidentally by almost any policy, making success rate saturate
+        # near 100% for every arm regardless of actual task competence.
+        self._success_hold_steps_required = max(1, round(self.cfg.success_hold_time / self._dt))
+        self._success_hold_counter = torch.zeros(self.num_envs, device=self.device)
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
         self._knob = Articulation(self.cfg.knob_cfg)
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        # No ground plane: the hand and knob are both mounted at a fixed
+        # height, not resting on or falling toward a floor, so the
+        # (purely cosmetic, USD-file-based) ground plane used by the
+        # cartpole/franka_cabinet templates isn't needed here -- and its
+        # default asset is Nucleus-hosted, another cloud dependency to avoid.
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
@@ -102,7 +123,7 @@ class KnobAllegroEnv(DirectRLEnv):
         self._actions = actions.clone().clamp(-1.0, 1.0)
 
     def _apply_action(self) -> None:
-        self._cur_targets[:, self._actuated_dof_idx] = scale(
+        self._cur_targets[:, self._actuated_dof_idx] = unscale_transform(
             self._actions,
             self._hand_dof_lower[:, self._actuated_dof_idx],
             self._hand_dof_upper[:, self._actuated_dof_idx],
@@ -132,10 +153,12 @@ class KnobAllegroEnv(DirectRLEnv):
     def _record_history_and_get_window(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         theta = self._knob.data.joint_pos[:, self._knob_joint_idx]
         theta_dot = self._knob.data.joint_vel[:, self._knob_joint_idx]
-        theta_ddot = (theta_dot - self._prev_theta_dot) / self._dt
+        raw_theta_ddot = (theta_dot - self._prev_theta_dot) / self._dt
+        alpha = self.cfg.wrench_accel_smoothing
+        self._smoothed_theta_ddot = alpha * raw_theta_ddot + (1.0 - alpha) * self._smoothed_theta_ddot
         # tau_R: the same inverse-dynamics operator applied to the robot's own
         # measured trajectory (section 7-8) -- not a separate force estimate.
-        tau_r = self._knob_dynamics.required_generalized_force(theta, theta_dot, theta_ddot)
+        tau_r = self._knob_dynamics.required_generalized_force(theta, theta_dot, self._smoothed_theta_ddot)
         progress = (theta - self.cfg.knob_theta0) / (self._theta_goal - self.cfg.knob_theta0)
 
         step = self.episode_length_buf.clamp(max=self._history_progress.shape[1] - 1)
@@ -211,9 +234,23 @@ class KnobAllegroEnv(DirectRLEnv):
         )
         shaping_reward = self._prev_distance - distance  # section 13 incremental reward
         self._prev_distance = distance
+        # _reset_idx() (called right after this, for envs done this step)
+        # zeroes _prev_distance for the next episode, so a diagnostic reader
+        # (evaluate.py) reaching into it after env.step() returns would only
+        # ever see the just-reset 0.0, never the real terminal value. extras
+        # is populated here (before reset) and passed through unchanged by
+        # RslRlVecEnvWrapper, so it survives the reset.
+        self.extras["physics_ot_distance"] = distance.clone()
 
         theta = self._knob.data.joint_pos[:, self._knob_joint_idx]
-        task_r, success = task_reward(theta, self._theta_goal, self.cfg.success_threshold)
+        task_r, at_goal_now = task_reward(theta, self._theta_goal, self.cfg.success_threshold)
+        self._success_hold_counter = torch.where(
+            at_goal_now, self._success_hold_counter + 1, torch.zeros_like(self._success_hold_counter)
+        )
+        success = self._success_hold_counter >= self._success_hold_steps_required
+        # See the note on physics_ot_distance above -- extras survives the
+        # reset that follows this call, unlike reaching into env state later.
+        self.extras["task_success"] = success.clone()
         action_penalty = self._actions.pow(2).sum(dim=-1)
 
         return compose_reward(task_r, success, shaping_reward, action_penalty, self._reward_weights)
@@ -242,4 +279,6 @@ class KnobAllegroEnv(DirectRLEnv):
         self._history_velocity[env_ids] = 0.0
         self._history_wrench[env_ids] = 0.0
         self._prev_theta_dot[env_ids] = 0.0
+        self._smoothed_theta_ddot[env_ids] = 0.0
         self._prev_distance[env_ids] = 0.0
+        self._success_hold_counter[env_ids] = 0.0

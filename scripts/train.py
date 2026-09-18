@@ -1,66 +1,91 @@
-"""Train a Physics-OT policy via IsaacLab's unified training CLI.
+"""Train a Physics-OT policy with RSL-RL PPO.
 
-IsaacLab's per-library ``scripts/reinforcement_learning/<lib>/train.py``
-entry points are deprecated in favor of ``isaaclab.sh train``; this is a
-thin wrapper around that command so the Experiment-0 ``--reward_mode`` sweep
-(sections 25-26) has a single, stable entry point here regardless of which
-exact IsaacLab CLI surface is current on the training machine.
-
-Requires the ``ISAACLAB_PATH`` environment variable (or ``--isaaclab_path``)
-to point at the IsaacLab checkout, and both ``physics-ot`` and
-``physics_ot_tasks`` to already be ``pip install -e``'d into that Python
-environment.
+Standalone script (same ``AppLauncher``-first pattern as ``zero_agent.py``/
+``evaluate.py``) rather than a wrapper around IsaacLab's ``isaaclab.sh
+train`` CLI: that subcommand doesn't exist on every IsaacLab checkout (some
+only have ``-i/-f/-p/-s/-t/-o/-v/-d/-n/-c/-u``), and the older per-library
+``scripts/reinforcement_learning/rsl_rl/train.py`` never imports
+``physics_ot_tasks``, so our task would never get registered there either.
 
 Example:
-    python scripts/train.py --task PhysicsOT-Knob-Allegro-Direct-v0 \\
-        --reward_mode physics_ot --num_envs 512
+    $ISAACLAB scripts/train.py --task PhysicsOT-Knob-Allegro-Direct-v0 \\
+        --reward_mode physics_ot --num_envs 512 --headless
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import platform
-import subprocess
-import sys
+import importlib.metadata
+from datetime import datetime
 from pathlib import Path
+
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("--task", type=str, default="PhysicsOT-Knob-Allegro-Direct-v0")
+parser.add_argument("--agent", type=str, default="rsl_rl_cfg_entry_point")
+parser.add_argument("--num_envs", type=int, default=None)
+parser.add_argument("--max_iterations", type=int, default=None)
+parser.add_argument("--seed", type=int, default=None)
+parser.add_argument(
+    "--reward_mode",
+    type=str,
+    default=None,
+    choices=["sparse", "state_tracking", "dtw_physics", "ot_state", "pointwise_physics", "physics_ot"],
+    help="Experiment-0 ablation arm (sections 25-26); overrides env_cfg.reward_mode directly.",
+)
+parser.add_argument(
+    "--experiment_name",
+    type=str,
+    default=None,
+    help="Overrides the log directory name; defaults to '<task's default>_<reward_mode>' when --reward_mode is set.",
+)
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+import gymnasium as gym
+
+import physics_ot_tasks  # noqa: F401
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
+from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--task", type=str, default="PhysicsOT-Knob-Allegro-Direct-v0")
-    parser.add_argument("--rl_library", type=str, default="rsl_rl")
-    parser.add_argument("--num_envs", type=int, default=None)
-    parser.add_argument("--max_iterations", type=int, default=None)
-    parser.add_argument(
-        "--reward_mode",
-        type=str,
-        default=None,
-        choices=["sparse", "state_tracking", "dtw_physics", "ot_state", "pointwise_physics", "physics_ot"],
-        help="Experiment-0 ablation arm (sections 25-26); passed through as a Hydra env override.",
-    )
-    parser.add_argument("--isaaclab_path", type=str, default=os.environ.get("ISAACLAB_PATH"))
-    args, extra = parser.parse_known_args()
+    from rsl_rl.runners import OnPolicyRunner
 
-    if not args.isaaclab_path:
-        raise SystemExit("Set ISAACLAB_PATH or pass --isaaclab_path to locate the IsaacLab checkout.")
-    isaaclab_path = Path(args.isaaclab_path)
-    launcher = isaaclab_path / ("isaaclab.bat" if platform.system() == "Windows" else "isaaclab.sh")
-    if not launcher.exists():
-        raise SystemExit(f"Could not find {launcher}; check --isaaclab_path/ISAACLAB_PATH.")
+    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
+    if args_cli.reward_mode is not None:
+        env_cfg.reward_mode = args_cli.reward_mode
 
-    cmd = [str(launcher), "train", "--rl_library", args.rl_library, "--task", args.task]
-    if args.num_envs is not None:
-        cmd += ["--num_envs", str(args.num_envs)]
-    if args.max_iterations is not None:
-        cmd += ["--max_iterations", str(args.max_iterations)]
-    if args.reward_mode is not None:
-        cmd += [f"env.reward_mode={args.reward_mode}"]
-    cmd += extra
+    agent_cfg = load_cfg_from_registry(args_cli.task, args_cli.agent)
+    if args_cli.max_iterations is not None:
+        agent_cfg.max_iterations = args_cli.max_iterations
+    if args_cli.seed is not None:
+        agent_cfg.seed = args_cli.seed
+    if args_cli.experiment_name is not None:
+        agent_cfg.experiment_name = args_cli.experiment_name
+    elif args_cli.reward_mode is not None:
+        agent_cfg.experiment_name = f"{agent_cfg.experiment_name}_{args_cli.reward_mode}"
+    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, importlib.metadata.version("rsl-rl-lib"))
+    env_cfg.seed = agent_cfg.seed
 
-    print("[train] " + " ".join(cmd))
-    sys.exit(subprocess.call(cmd))
+    log_root = Path("logs", "rsl_rl", agent_cfg.experiment_name).resolve()
+    log_dir = log_root / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    print(f"[train] logging to {log_dir}")
+
+    env = gym.make(args_cli.task, cfg=env_cfg)
+    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+
+    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=str(log_dir), device=agent_cfg.device)
+    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    env.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        simulation_app.close()

@@ -1,3 +1,4 @@
+README.md
 pyproject.toml
 physics_ot/__init__.py
 physics_ot/rewards.py
@@ -17,6 +18,19 @@ physics_ot/ot/temporal_ot.py
 physics_ot/references/__init__.py
 physics_ot/references/build_reference.py
 physics_ot/references/smooth.py
+poise_ot/__init__.py
+poise_ot/alignment.py
+poise_ot/knob_env.py
+poise_ot/mech_cost.py
+poise_ot/reference_generator.py
+poise_ot/token_builder.py
+poise_ot/two_critic_sac.py
+poise_ot/video/__init__.py
+poise_ot/video/confidence_gate.py
+poise_ot/video/inverse_dynamics.py
+poise_ot/video/smoothing.py
+poise_ot/video/video_loader.py
+tests/test_baselines.py
 tests/test_build_reference.py
 tests/test_inverse_dynamics.py
 tests/test_reward.py

@@ -1,0 +1,20 @@
+[
+  {
+    "clip_id": "clip_clean",
+    "raw_smoothed_rms_gap": 0.0033333495539940314,
+    "theta_ddot_variance": 2773.0505870954867,
+    "differentiation_flagged": true,
+    "token_plausible": true,
+    "confidence_min": 0.0,
+    "confidence_mean": 0.08082518848005851
+  },
+  {
+    "clip_id": "clip_occluded",
+    "raw_smoothed_rms_gap": 0.0033329791906869938,
+    "theta_ddot_variance": 130466.39998047687,
+    "differentiation_flagged": true,
+    "token_plausible": false,
+    "confidence_min": 0.0,
+    "confidence_mean": 0.05356988288823876
+  }
+]

@@ -56,6 +56,11 @@ KNOB_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=KNOB_USD_PATH,
         activate_contact_sensors=True,
+        # The base link ("Mount") is a plain (non-kinematic) rigid body --
+        # PhysX articulations reject kinematic links entirely. Fixing the
+        # base is instead done here, PhysX's actual mechanism for a
+        # fixed-base articulation (same as any robot arm bolted to a table).
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(fix_root_link=True),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, -0.17, 0.5),
@@ -67,6 +72,20 @@ KNOB_CFG = ArticulationCfg(
     # dynamics model used to build the Physics-OT reference (section 5).
     actuators={},
 )
+
+# PHYSICS_OT_ALLEGRO_USD_PATH optionally overrides the Allegro hand's USD
+# source with a local path -- e.g. a directory mirrored offline via
+# `aws s3 sync --no-sign-request` from the same Nucleus/S3 asset root
+# ALLEGRO_HAND_CFG points at by default, on machines with no route to
+# NVIDIA's cloud asset server. Computed at module scope (not inside the
+# configclass body) so this stays a plain module constant rather than an
+# accidental extra config field -- IsaacLab's `configclass` treats *every*
+# class-body attribute as a real field, unlike plain `dataclasses`.
+_allegro_usd_override = os.environ.get("PHYSICS_OT_ALLEGRO_USD_PATH")
+if _allegro_usd_override:
+    ROBOT_CFG = ALLEGRO_HAND_CFG.replace(spawn=ALLEGRO_HAND_CFG.spawn.replace(usd_path=_allegro_usd_override))
+else:
+    ROBOT_CFG = ALLEGRO_HAND_CFG
 
 
 @configclass
@@ -93,7 +112,7 @@ class KnobAllegroEnvCfg(DirectRLEnvCfg):
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=512, env_spacing=0.75, replicate_physics=True)
 
     # robot / object
-    robot_cfg: ArticulationCfg = ALLEGRO_HAND_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    robot_cfg: ArticulationCfg = ROBOT_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     knob_cfg: ArticulationCfg = KNOB_CFG.replace(prim_path="/World/envs/env_.*/Knob")
 
     actuated_joint_names = [
@@ -135,6 +154,8 @@ class KnobAllegroEnvCfg(DirectRLEnvCfg):
     knob_coulomb_torque = _KNOB["coulomb_torque"]
     knob_v_eps = _KNOB["v_eps"]
     success_threshold = _KNOB["success_threshold"]
+    success_hold_time = _KNOB["success_hold_time"]
+    wrench_accel_smoothing = _KNOB["wrench_accel_smoothing"]
 
     # reward_mode selects which Physics-OT / baseline distance function
     # drives the shaping reward (Experiment 0, sections 25-26):

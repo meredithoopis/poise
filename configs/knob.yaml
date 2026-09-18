@@ -9,7 +9,15 @@ knob:
   stiffness: 0.10          # k [N*m/rad]
   coulomb_torque: 0.04      # tau_c [N*m]
   v_eps: 0.05               # velocity smoothing scale for tanh Coulomb model [rad/s]
-  success_threshold: 0.05   # |theta - theta_goal| below which the task counts as solved [rad]
+  success_threshold: 0.05   # |theta - theta_goal| below which the knob is "at the goal" [rad]
+  success_hold_time: 0.5    # seconds the knob must stay at the goal, consecutively, to count as solved
+                             # (touching the goal once is not "success" -- prevents a near-100%-for-
+                             # every-policy ceiling effect from incidental contact ever brushing past it)
+  wrench_accel_smoothing: 0.2   # EMA alpha (0-1) for the acceleration estimate used only in tau_R's
+                                 # finite-difference (section 7-8) -- lower = smoother/more lag. A raw
+                                 # single-step diff of theta_dot is noisy during contact transients,
+                                 # which the physics_ot reward mode is far more sensitive to than the
+                                 # other modes' simpler wrench aggregations (DTW, pointwise).
 
 reference:
   num_tokens: 64            # T_H

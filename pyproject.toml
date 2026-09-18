@@ -12,10 +12,11 @@ dependencies = [
     "numpy>=1.23",
     "scipy>=1.10",
     "pyyaml>=6.0",
+    "gymnasium>=0.29",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
-include = ["physics_ot*"]
+include = ["physics_ot*", "poise_ot*"]

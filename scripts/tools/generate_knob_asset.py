@@ -36,15 +36,23 @@ def build_knob_usd(output_path: Path, radius: float, height: float) -> None:
     world = UsdGeom.Xform.Define(stage, "/World")
     stage.SetDefaultPrim(world.GetPrim())
 
-    # Fixed base: static collider, articulation root.
+    # Fixed base ("Mount") and articulation root are the SAME prim: IsaacLab's
+    # fix_root_link handling (schemas.modify_articulation_root_properties)
+    # looks for RigidBodyAPI on the ArticulationRootAPI prim itself, not on a
+    # descendant, so a separate Xform-with-a-rigid-body-child doesn't work.
+    # It must NOT be kinematic -- PhysX articulations reject kinematic links
+    # entirely ("Articulations with kinematic bodies are not supported").
+    # The base is fixed instead via
+    # ArticulationRootPropertiesCfg(fix_root_link=True) in
+    # knob_allegro_env_cfg.py, PhysX's proper mechanism for a fixed-base
+    # articulation (the same pattern as any robot arm bolted to a table).
     base_path = "/World/KnobBase"
-    base_xform = UsdGeom.Xform.Define(stage, base_path)
-    UsdPhysics.ArticulationRootAPI.Apply(base_xform.GetPrim())
-
-    base_geom = UsdGeom.Cylinder.Define(stage, base_path + "/Mount")
+    base_geom = UsdGeom.Cylinder.Define(stage, base_path)
     base_geom.CreateRadiusAttr(radius * 1.5)
     base_geom.CreateHeightAttr(height * 0.3)
     base_geom.CreateAxisAttr(UsdGeom.Tokens.z)
+    UsdPhysics.ArticulationRootAPI.Apply(base_geom.GetPrim())
+    UsdPhysics.RigidBodyAPI.Apply(base_geom.GetPrim())
     UsdPhysics.CollisionAPI.Apply(base_geom.GetPrim())
 
     # Moving link: the knob itself.
@@ -54,6 +62,14 @@ def build_knob_usd(output_path: Path, radius: float, height: float) -> None:
     knob_geom.CreateHeightAttr(height)
     knob_geom.CreateAxisAttr(UsdGeom.Tokens.z)
     UsdGeom.XformCommonAPI(knob_geom).SetTranslate(Gf.Vec3d(0.0, 0.0, height))
+    # Required whenever a RigidBodyAPI prim is nested under another
+    # RigidBodyAPI prim (KnobBase): PhysX otherwise doesn't know whether to
+    # treat the child's transform as parent-relative or independent, and
+    # warns "missing xformstack reset ... will cause unpredicted results".
+    # This makes the translate above an independent world-space offset
+    # rather than one chained through KnobBase's (identity, but ambiguous)
+    # transform.
+    knob_geom.SetResetXformStack(True)
     UsdPhysics.RigidBodyAPI.Apply(knob_geom.GetPrim())
     UsdPhysics.CollisionAPI.Apply(knob_geom.GetPrim())
     mass_api = UsdPhysics.MassAPI.Apply(knob_geom.GetPrim())
@@ -61,9 +77,11 @@ def build_knob_usd(output_path: Path, radius: float, height: float) -> None:
 
     # Revolute joint about Z, free (no drive -- torque is applied from Python
     # each step via KnobDynamics.passive_torque() + contact from the hand).
+    # body0 = the base link itself, body1 = Knob (the dynamic link) -- both
+    # real rigid bodies, as PhysX articulations require.
     joint = UsdPhysics.RevoluteJoint.Define(stage, base_path + "/knob_joint")
     joint.CreateAxisAttr("Z")
-    joint.CreateBody0Rel().SetTargets([Sdf.Path(base_path + "/Mount")])
+    joint.CreateBody0Rel().SetTargets([Sdf.Path(base_path)])
     joint.CreateBody1Rel().SetTargets([Sdf.Path(knob_path)])
     joint.CreateLocalPos0Attr(Gf.Vec3f(0.0, 0.0, height))
     joint.CreateLocalPos1Attr(Gf.Vec3f(0.0, 0.0, 0.0))
