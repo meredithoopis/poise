@@ -312,21 +312,37 @@ training problem exists.
 ## Running Stage 2 (needs an actual HOI4D download)
 
 **External prerequisite**: this repo does not bundle HOI4D
-(https://hoi4d.github.io). Point `POISE_OT_HOI4D_ROOT` at a local download
-before running against real data:
+(https://hoi4d.github.io). See `docs/HOI4D_DOWNLOAD.md` for what to
+request (category `Safe`/task `T1`, why) and how to fetch just the needed
+files (`objpose/*.json` + `mobility_v2.json`) out of the annotations/CAD
+zips without unpacking the full ~20GB archives, via
+`scripts/stage2/select_hoi4d_clips.py`. That script's `--output` produces a
+clip-list file the pipeline below consumes; `--out_dir` is what
+`POISE_OT_HOI4D_ROOT` should point at:
 
 ```bash
-export POISE_OT_HOI4D_ROOT=/path/to/hoi4d
-python scripts/stage2/run_stage2_pipeline.py --category Safe --num_clips 10
-python scripts/stage2/run_stage2_checks.py --category Safe --num_clips 5 \
+python scripts/stage2/select_hoi4d_clips.py \
+    --release_txt /path/to/HOI4D-Instructions/release.txt \
+    --category C6 --task T1 --num_clips 12 --output data/clip_list.txt \
+    --annotations_source /path/to/HOI4D_annotations.zip \
+    --cad_source /path/to/HOI4D_CAD_Model_for_release.zip \
+    --out_dir data/hoi4d_raw --probe --fetch
+
+export POISE_OT_HOI4D_ROOT=data/hoi4d_raw
+python scripts/stage2/run_stage2_pipeline.py --clip_list data/clip_list.txt
+python scripts/stage2/run_stage2_checks.py --clip_list data/clip_list.txt \
     --flagged_clips <clip_id_with_visible_occlusion> <another_clip_id>
 ```
 
-`video_loader.py`'s raw-format parser (`load_clip_raw`) is a **best-effort,
-unverified** guess at HOI4D's per-frame annotation layout -- it was written
-without access to a real download. If it raises or parses incorrectly,
-preprocess a clip into the simple `{t, theta}` npz format instead and use
-`--npz_clips`:
+`video_loader.py`'s raw-format parser (`load_clip_raw`) is **verified
+against real HOI4D data** (category `Safe`) -- it computes the moving
+part's rotation *relative to* the object's static base part (HOI4D is
+egocentric video, so a part's raw absolute rotation is contaminated by
+camera motion) and projects that onto the joint's axis from
+`mobility_v2.json`. See `docs/HOI4D_DOWNLOAD.md`'s "Resolved" section for
+what this fixed and what's still unverified for other categories. If a
+clip's parser fails for a different category/label convention, preprocess
+it into the simple `{t, theta}` npz format instead and use `--npz_clips`:
 
 ```bash
 python scripts/stage2/run_stage2_checks.py --npz_clips clip1.npz clip2.npz
@@ -344,3 +360,90 @@ anything else -- HOI4D provides no ground-truth mass/inertia/damping/
 stiffness/friction, so these values are never measured, only assumed, and
 that assumption is logged explicitly every time rather than silently baked
 into results.
+
+## POISE-OT: Stage 3 (real IsaacLab simulator, Allegro hand + knob)
+
+**Needs Isaac Sim/Isaac Lab and a GPU -- not runnable on this dev machine.**
+Everything below was written by mirroring the already-validated
+`knob_allegro` (Physics-OT/Stage-A/Experiment-0) task as closely as
+possible and reusing its assets, but **has not been run against real Isaac
+Sim** -- the first real test of this code is launching it on your machine,
+not something completed here. Stage 3 only covers steps 6-11 of the plan
+(bare env through the first small-scale regression check); steps 12-16
+(scale-up, domain randomization, the real-HOI4D-reference swap, the
+physics sweep, and the full Phase-I ablation table) are not implemented --
+each is gated on the previous step actually passing on real hardware,
+which can't happen from here.
+
+**Before touching Stage 3**, three prerequisite fixes from the checklist
+were verified/applied against the actual code (not just assumed done):
+- Two-critic SAC's target-network Polyak averaging: already present in
+  `poise_ot/two_critic_sac.py`, no change needed.
+- Angle unwrapping before differentiation: real bug, fixed in
+  `poise_ot/video/video_loader.py`'s `load_clip_raw` (`Rotation.as_rotvec()`'s
+  branch cut at near-zero rotation was producing spurious jumps -- exactly
+  what showed up as a blow-up on `N03_S247_s01`).
+- `run_stage2_checks.py`'s `differentiation_flagged` threshold: was
+  comparing incompatible units (variance in rad²/s⁴ against a raw-angle
+  std in rad) regardless of the multiplier's value -- rewritten to compare
+  like-for-like (both in rad/s²).
+
+Two items are **not done** and need your own machine's output, not a guess:
+recalibrating `confidence_gate.py`'s formula against real clean-vs-corrupted
+clips, and re-running Stage 1's check 3 to confirm the critic loss plateaus
+past step 2750 with the (already-present) target-network fix. Send me the
+real numbers from either and I'll act on them -- I did not fabricate a fix
+for either here.
+
+### Layout (additions)
+
+- `source/physics_ot_tasks/physics_ot_tasks/direct/knob_allegro_poise/` --
+  a new IsaacLab task, sibling to (not a modification of) `knob_allegro/`.
+  Reuses that task's Allegro hand and knob USD assets and physics wiring
+  (passive-torque application, inverse-dynamics `tau` recovery) verbatim,
+  but returns *only* `r_task` (Eq task_reward) as the step reward and
+  exposes raw state via `extras` for two-critic SAC's external alignment
+  loop -- unlike `knob_allegro_env.py`, which blends task + shaping reward
+  into one PPO-compatible scalar via `compose_reward`. Registered as
+  `PoiseOT-Knob-Allegro-Direct-v0`.
+- `scripts/stage3/train_stage3.py` -- step 11's training loop: the real env
+  above, driving `poise_ot.alignment`/`poise_ot.mech_cost`/
+  `poise_ot.two_critic_sac` completely unchanged from Stage 1 (that's the
+  entire point of the regression-check gate: if training here behaves
+  differently from Stage 1's toy env, the bug is in the simulator/env
+  wiring, not in this already-validated code).
+- `scripts/stage3/run_stage3_regression_check.py` -- step 11's gate,
+  comparing a `train_stage1.py --output ...` history against a
+  `train_stage3.py --output ...` history for comparable critic-loss
+  trend/magnitude (not exact match -- the environments differ).
+
+
+  
+
+### Running Stage 3
+
+```bash
+# 1. Stage-1 reference run (same synthetic theta_H(t), for the regression-check comparison)
+python scripts/stage1/train_stage1.py --episodes 30 --output logs/stage1_history.json
+
+# 2. Bare launch test first (step 6) -- confirm the env launches and steps at all
+#    before trusting anything built on top of it:
+$ISAACLAB scripts/zero_agent.py --task PoiseOT-Knob-Allegro-Direct-v0 --num_envs 16
+
+# 3. Step 11's small-scale regression check
+$ISAACLAB scripts/stage3/train_stage3.py --task PoiseOT-Knob-Allegro-Direct-v0 \
+    --num_envs 16 --episodes 20 --cost_mode mechanics_ot --headless \
+    --output logs/stage3_history.json
+
+python scripts/stage3/run_stage3_regression_check.py \
+    --stage1_history logs/stage1_history.json --stage3_history logs/stage3_history.json
+```
+
+If step 2 fails to launch, that's diagnostic on its own (asset paths,
+`PHYSICS_OT_ALLEGRO_USD_PATH`/`PHYSICS_OT_DATA_DIR` overrides, IsaacLab
+version) -- fix that before running step 3. If step 3's check fails, per
+the plan: the bug is in `knob_allegro_poise_env.py`/
+`knob_allegro_poise_env_cfg.py`, not in the untouched alignment/cost/SAC
+code. Send me whatever actually happens (a traceback, or the check's
+printed numbers) -- I can't predict which from here, and I'd rather fix a
+real failure than have guessed around one.

@@ -8,8 +8,9 @@ Unlike Stage 1's checks, #1 is explicitly NOT auto-pass/fail (the spec asks
 for visual inspection); #2-4 do have an automatic verdict, reported with the
 actual numbers behind it.
 
-Usage (against real HOI4D, once POISE_OT_HOI4D_ROOT is set):
-    python scripts/stage2/run_stage2_checks.py --category Safe --num_clips 5
+Usage (against real HOI4D, once POISE_OT_HOI4D_ROOT is set and clips have
+been fetched via scripts/stage2/select_hoi4d_clips.py):
+    python scripts/stage2/run_stage2_checks.py --clip_list data/clip_list.txt --num_clips 5
 
 Usage (against pre-processed npz clips, e.g. for a dry run / this script's
 own test coverage):
@@ -36,7 +37,7 @@ from run_stage2_pipeline import load_assumed_params  # noqa: E402
 from poise_ot.video.confidence_gate import compute_confidence  # noqa: E402
 from poise_ot.video.inverse_dynamics import target_conditioned_torque  # noqa: E402
 from poise_ot.video.smoothing import smooth_clip  # noqa: E402
-from poise_ot.video.video_loader import load_clip_npz, load_clip_raw, list_clips  # noqa: E402
+from poise_ot.video.video_loader import hoi4d_root, load_clip_npz, load_clip_raw  # noqa: E402
 
 LOG_DIR = REPO_ROOT / "logs" / "stage2"
 
@@ -60,13 +61,14 @@ def _maybe_plot(fig_fn, path: Path) -> None:
 def load_clips(args):
     if args.npz_clips:
         return [load_clip_npz(p, category=args.category) for p in args.npz_clips]
-    clip_dirs = list_clips(args.category)[: args.num_clips]
+    root = args.hoi4d_root or hoi4d_root()
+    clip_ids = [line.strip() for line in args.clip_list.read_text().splitlines() if line.strip()][: args.num_clips]
     clips = []
-    for clip_dir in clip_dirs:
+    for clip_id in clip_ids:
         try:
-            clips.append(load_clip_raw(clip_dir, category=args.category))
-        except (FileNotFoundError, KeyError) as exc:
-            print(f"  SKIPPED {clip_dir.name}: {exc}")
+            clips.append(load_clip_raw(clip_id, root=root))
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            print(f"  SKIPPED {clip_id}: {exc}")
     return clips
 
 
@@ -84,12 +86,26 @@ def run_checks_for_clip(clip, params, args) -> dict:
     )
 
     # --- Check 2: differentiation sanity ---
-    theta_noise_floor = float(np.std(np.diff(clip.theta))) if len(clip.theta) > 1 else 0.0
-    theta_ddot_variance = float(np.var(ind_result.theta_ddot))
-    threshold = args.theta_ddot_noise_multiplier * max(theta_noise_floor, 1e-9)
-    diff_flagged = theta_ddot_variance > threshold
-    print(f"    check2 theta_ddot variance={theta_ddot_variance:.5g}, flag threshold={threshold:.5g}, "
-          f"{'FLAGGED (likely under-smoothed)' if diff_flagged else 'ok'}")
+    # theta_ddot_std and the noise floor below are both in rad/s^2, so the
+    # multiplier is a genuine, dimensionless amplification factor -- an
+    # earlier version compared theta_ddot's *variance* (rad^2/s^4) against
+    # the raw angle differences' std (rad, dt never divided out), which was
+    # dimensionally meaningless regardless of the multiplier's value.
+    dt_raw = float(np.mean(np.diff(clip.t))) if len(clip.t) > 1 else 1.0
+    theta_diff_std = float(np.std(np.diff(clip.theta))) if len(clip.theta) > 1 else 0.0
+    # sigma_theta ~= theta_diff_std / sqrt(2) (std of a difference of two
+    # iid-noise samples); a naive central second difference
+    # (theta[i+1]-2*theta[i]+theta[i-1])/dt^2 then has std
+    # sqrt(6)*sigma_theta/dt^2 -- the noise floor a *raw*, unsmoothed double
+    # difference would produce, i.e. exactly what smoothing is meant to
+    # suppress (Sec 4's "three orders of magnitude" amplification warning).
+    raw_ddot_noise_floor = np.sqrt(3.0) * theta_diff_std / max(dt_raw, 1e-9) ** 2
+    theta_ddot_std = float(np.std(ind_result.theta_ddot))
+    threshold = args.theta_ddot_noise_multiplier * max(raw_ddot_noise_floor, 1e-9)
+    diff_flagged = theta_ddot_std > threshold
+    print(f"    check2 theta_ddot std={theta_ddot_std:.5g} rad/s^2, raw-double-diff noise floor="
+          f"{raw_ddot_noise_floor:.5g} rad/s^2, flag threshold={threshold:.5g} rad/s^2, "
+          f"{'FLAGGED (smoothing did not suppress the raw-differentiation noise floor)' if diff_flagged else 'ok'}")
     _maybe_plot(
         lambda plt: _differentiation_figure(plt, ind_result.t, ind_result.theta_dot, ind_result.theta_ddot),
         LOG_DIR / f"{clip.clip_id}_check2_differentiation.png",
@@ -112,7 +128,7 @@ def run_checks_for_clip(clip, params, args) -> dict:
     return {
         "clip_id": clip.clip_id,
         "raw_smoothed_rms_gap": float(np.sqrt(np.mean((clip.theta - fitted_at_raw) ** 2))),
-        "theta_ddot_variance": theta_ddot_variance,
+        "theta_ddot_std": theta_ddot_std,
         "differentiation_flagged": diff_flagged,
         "token_plausible": token_plausible,
         "confidence_min": c_min,
@@ -145,6 +161,11 @@ def _differentiation_figure(plt, t, theta_dot, theta_ddot):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--category", type=str, default="Safe")
+    parser.add_argument("--clip_list", type=Path, default=None,
+                         help="One release.txt-style clip_id per line (select_hoi4d_clips.py's --output). Required unless --npz_clips is given.")
+    parser.add_argument("--hoi4d_root", type=Path, default=None,
+                         help="Directory containing HOI4D_annotations/ and HOI4D_CAD_Model_for_release/ "
+                              "(defaults to POISE_OT_HOI4D_ROOT).")
     parser.add_argument("--num_clips", type=int, default=5)
     parser.add_argument("--npz_clips", type=str, nargs="*", default=None, help="Pre-processed (t, theta) npz clips, bypassing HOI4D entirely.")
     parser.add_argument("--num_tokens", type=int, default=64)
@@ -161,12 +182,16 @@ def main() -> None:
     args.plausible_power_range = s2["plausible_power_range"]
     args.theta_ddot_noise_multiplier = s2["theta_ddot_noise_multiplier"]
 
+    if not args.npz_clips and not args.clip_list:
+        raise SystemExit("pass --npz_clips, or --clip_list (from select_hoi4d_clips.py's --output) "
+                          "with POISE_OT_HOI4D_ROOT/--hoi4d_root set")
+
     params = load_assumed_params(args.config)
     print(f"[stage2_checks] ASSUMED target params (not measured): {params}")
 
     clips = load_clips(args)
     if not clips:
-        raise SystemExit("no clips loaded -- pass --npz_clips or set POISE_OT_HOI4D_ROOT and use --category/--num_clips")
+        raise SystemExit("no clips loaded -- see SKIPPED messages above")
 
     results = []
     for clip in clips:

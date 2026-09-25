@@ -1,14 +1,22 @@
-"""Batch ~10 HOI4D clips through video_loader -> smoothing -> inverse_dynamics
+"""Batch HOI4D clips through video_loader -> smoothing -> inverse_dynamics
 -> confidence_gate -> token_builder (the last step literally unchanged from
 Stage 1 -- that's the entire point of factoring it out on its own) and write
 one token sequence + npz per clip to data/stage2_tokens/.
 
-**External prerequisite**: requires POISE_OT_HOI4D_ROOT to point at an
-actual local HOI4D download. This script does not fetch the dataset.
+**External prerequisite**: requires POISE_OT_HOI4D_ROOT to point at the
+directory containing HOI4D_annotations/ and HOI4D_CAD_Model_for_release/
+(i.e. select_hoi4d_clips.py --fetch's --out_dir), and a clip-list file (its
+--output) naming which release.txt-style clip_ids to process. This script
+does not fetch the dataset -- see scripts/stage2/select_hoi4d_clips.py and
+docs/HOI4D_DOWNLOAD.md.
 
 Usage:
-    POISE_OT_HOI4D_ROOT=/path/to/hoi4d python scripts/stage2/run_stage2_pipeline.py \\
-        --category Safe --num_clips 10
+    python scripts/stage2/select_hoi4d_clips.py --release_txt ... \\
+        --category C6 --task T1 --num_clips 12 --output data/clip_list.txt \\
+        --annotations_source ... --cad_source ... --out_dir data/hoi4d_raw --fetch
+
+    POISE_OT_HOI4D_ROOT=data/hoi4d_raw python scripts/stage2/run_stage2_pipeline.py \\
+        --clip_list data/clip_list.txt
 """
 
 from __future__ import annotations
@@ -33,7 +41,7 @@ from poise_ot.token_builder import build_token  # noqa: E402
 from poise_ot.video.confidence_gate import compute_confidence  # noqa: E402
 from poise_ot.video.inverse_dynamics import target_conditioned_torque  # noqa: E402
 from poise_ot.video.smoothing import smooth_clip  # noqa: E402
-from poise_ot.video.video_loader import RawClip, list_clips, load_clip_raw  # noqa: E402
+from poise_ot.video.video_loader import RawClip, hoi4d_root, load_clip_raw  # noqa: E402
 
 
 def load_assumed_params(poise_cfg_path: Path) -> KnobParams:
@@ -98,8 +106,11 @@ def process_clip(clip: RawClip, params: KnobParams, num_tokens: int, smoothing: 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--category", type=str, default="Safe", choices=["Safe", "StorageFurniture"])
-    parser.add_argument("--num_clips", type=int, default=10)
+    parser.add_argument("--clip_list", type=Path, required=True,
+                         help="One release.txt-style clip_id per line (select_hoi4d_clips.py's --output).")
+    parser.add_argument("--hoi4d_root", type=Path, default=None,
+                         help="Directory containing HOI4D_annotations/ and HOI4D_CAD_Model_for_release/ "
+                              "(defaults to POISE_OT_HOI4D_ROOT).")
     parser.add_argument("--num_tokens", type=int, default=64)
     parser.add_argument("--smoothing", type=float, default=1e-3, help="Nonzero -- real video needs actual smoothing, unlike Stage 1's exact synthetic data.")
     parser.add_argument("--residual_scale", type=float, default=0.05, help="Normalizes the residual-confidence signal; defaults to configs/knob.yaml's success_threshold scale.")
@@ -107,21 +118,22 @@ def main() -> None:
     parser.add_argument("--output_dir", type=Path, default=REPO_ROOT / "data" / "stage2_tokens")
     args = parser.parse_args()
 
+    root = args.hoi4d_root or hoi4d_root()
     params = load_assumed_params(args.config)
     print(f"[stage2_pipeline] ASSUMED target params (not measured from HOI4D): {asdict(params)}")
 
-    clip_dirs = list_clips(args.category)[: args.num_clips]
-    if not clip_dirs:
-        raise SystemExit(f"no clips found for category={args.category!r}")
+    clip_ids = [line.strip() for line in args.clip_list.read_text().splitlines() if line.strip()]
+    if not clip_ids:
+        raise SystemExit(f"no clip_ids found in {args.clip_list}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest = []
-    for clip_dir in clip_dirs:
+    for clip_id in clip_ids:
         try:
-            clip = load_clip_raw(clip_dir, category=args.category)
+            clip = load_clip_raw(clip_id, root=root)
             result = process_clip(clip, params, args.num_tokens, args.smoothing, impulse_window=5, residual_scale=args.residual_scale)
         except (FileNotFoundError, KeyError, ValueError) as exc:
-            print(f"[stage2_pipeline] SKIPPED {clip_dir.name}: {exc}")
+            print(f"[stage2_pipeline] SKIPPED {clip_id}: {exc}")
             continue
 
         out_path = args.output_dir / f"{result['clip_id']}.npz"
@@ -134,7 +146,7 @@ def main() -> None:
 
     manifest_path = args.output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
-    print(f"[stage2_pipeline] done -- {len(manifest)}/{len(clip_dirs)} clips processed, manifest -> {manifest_path}")
+    print(f"[stage2_pipeline] done -- {len(manifest)}/{len(clip_ids)} clips processed, manifest -> {manifest_path}")
 
 
 if __name__ == "__main__":
